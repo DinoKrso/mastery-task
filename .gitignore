@@ -40,6 +40,5 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# app samples / large OCR assets
+# app samples (kept out of repo to keep it lean)
 /public/samples/
-eng.traineddata

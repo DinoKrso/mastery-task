@@ -236,7 +236,16 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
     const { createWorker, PSM } = await import('tesseract.js');
     // Avoid Next's bundled module id here; worker_threads needs a real filesystem path.
     const workerPath = join(process.cwd(), 'node_modules/tesseract.js/src/worker-script/node/index.js');
-    worker = await createWorker('eng', undefined, { workerPath });
+    // Use the bundled language data (eng.traineddata at the project root) instead of
+    // letting Tesseract download ~10MB from the CDN on every cold start.
+    const langPath = process.cwd();
+    worker = await createWorker('eng', undefined, {
+      workerPath,
+      langPath,
+      cachePath: '/tmp',
+      cacheMethod: 'readOnly',
+      gzip: false,
+    });
 
     const variants = await buildOcrImageVariants(buffer);
     // Keep OCR bounded and predictable: fewer combinations, better latency.
@@ -361,11 +370,23 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
 
   // Use pdfjs directly in worker-free mode for reliability in serverless deployments.
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const { join } = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+  const cMapUrl = pathToFileURL(
+    join(process.cwd(), 'node_modules/pdfjs-dist/cmaps/'),
+  ).toString();
+  const standardFontDataUrl = pathToFileURL(
+    join(process.cwd(), 'node_modules/pdfjs-dist/standard_fonts/'),
+  ).toString();
   try {
     const loadingTask = pdfjs.getDocument(({
       data: new Uint8Array(buffer),
       disableWorker: true,
       useWorkerFetch: false,
+      isEvalSupported: false,
+      cMapUrl,
+      cMapPacked: true,
+      standardFontDataUrl,
       verbosity: (pdfjs as { VerbosityLevel?: { ERRORS?: number } }).VerbosityLevel?.ERRORS ?? 0,
     }) as unknown as Parameters<typeof pdfjs.getDocument>[0]);
     try {
