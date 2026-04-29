@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import { validate } from '@/lib/validation';
 import { parseCsv, parsePlainText } from '@/lib/parser';
 import { ExtractedData, FileType } from '@/lib/types';
+import type { PSM } from 'tesseract.js';
 
 export const runtime = 'nodejs';
 
@@ -38,7 +39,7 @@ type OcrImageVariant = {
 
 type OcrAttempt = {
   variant: string;
-  psm: string;
+  psm: PSM;
   confidence: number;
   text: string;
   parsed: ExtractedData;
@@ -249,13 +250,13 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
 
   try {
     const { join } = await import('node:path');
-    const { createWorker } = await import('tesseract.js');
+    const { createWorker, PSM } = await import('tesseract.js');
     // Avoid Next's bundled module id here; worker_threads needs a real filesystem path.
     const workerPath = join(process.cwd(), 'node_modules/tesseract.js/src/worker-script/node/index.js');
     worker = await createWorker('eng', undefined, { workerPath });
 
     const variants = await buildOcrImageVariants(buffer);
-    const psmModes = ['6', '4', '11']; // block text, columns, sparse text
+    const psmModes: PSM[] = [PSM.SINGLE_BLOCK, PSM.SINGLE_COLUMN, PSM.SPARSE_TEXT];
     const attempts: OcrAttempt[] = [];
 
     for (const variant of variants) {
