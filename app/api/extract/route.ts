@@ -352,7 +352,14 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
 }
 
 async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
-  // pdf-parse v2: use the PDFParse class (not the v1 function API)
+  // pdf-parse v2: use the Node export to avoid browser-only shims.
+  // In some production Node runtimes, pdf.js expects DOMMatrix; polyfill it if missing.
+  if (typeof (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix === 'undefined') {
+    const mod = await import('dommatrix');
+    // dommatrix exports a CSSMatrix-compatible class as the default export.
+    (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix = (mod as { default: unknown }).default;
+  }
+
   const { PDFParse } = await import('pdf-parse');
   const parser = new PDFParse({ data: buffer });
   try {
