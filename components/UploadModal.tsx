@@ -13,6 +13,7 @@ interface Props {
 type UploadState = { status: 'idle' } | { status: 'uploading'; filename: string } | { status: 'success'; docId: string } | { status: 'error'; message: string };
 
 const ACCEPTED = '.pdf,.png,.jpg,.jpeg,.gif,.webp,.csv,.txt';
+const EXTRACT_TIMEOUT_MS = 30_000;
 
 export function UploadModal({ open, onClose }: Props) {
   const router = useRouter();
@@ -43,14 +44,29 @@ export function UploadModal({ open, onClose }: Props) {
     setUploadState({ status: 'uploading', filename: file.name });
     const formData = new FormData();
     formData.append('file', file);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), EXTRACT_TIMEOUT_MS);
 
     try {
-      const res = await fetch('/api/extract', { method: 'POST', body: formData });
+      const res = await fetch('/api/extract', {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Upload failed');
       setUploadState({ status: 'success', docId: json.id });
     } catch (err) {
-      setUploadState({ status: 'error', message: err instanceof Error ? err.message : 'Unknown error' });
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setUploadState({
+          status: 'error',
+          message: 'Processing took too long. Please retry with a smaller/clearer file.',
+        });
+      } else {
+        setUploadState({ status: 'error', message: err instanceof Error ? err.message : 'Unknown error' });
+      }
+    } finally {
+      clearTimeout(timeoutId);
     }
   }, []);
 

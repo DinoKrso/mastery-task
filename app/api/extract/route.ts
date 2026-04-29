@@ -352,7 +352,6 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
 }
 
 async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
-  // pdf-parse v2: use the Node export to avoid browser-only shims.
   // In some production Node runtimes, pdf.js expects DOMMatrix; polyfill it if missing.
   if (typeof (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix === 'undefined') {
     const mod = await import('dommatrix');
@@ -360,45 +359,53 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
     (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix = (mod as { default: unknown }).default;
   }
 
-  const { PDFParse } = await import('pdf-parse');
-  // Critical for serverless: avoid any PDF.js worker initialization, because the worker module
-  // often isn't packaged in the deployed runtime (causing "Setting up fake worker failed").
-  const parser = new PDFParse({ data: buffer, disableWorker: true } as unknown as ConstructorParameters<typeof PDFParse>[0]);
+  // Use pdfjs directly in worker-free mode for reliability in serverless deployments.
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
   try {
+    const loadingTask = pdfjs.getDocument(({
+      data: new Uint8Array(buffer),
+      disableWorker: true,
+      useWorkerFetch: false,
+      verbosity: (pdfjs as { VerbosityLevel?: { ERRORS?: number } }).VerbosityLevel?.ERRORS ?? 0,
+    }) as unknown as Parameters<typeof pdfjs.getDocument>[0]);
     try {
-      const textRes = await parser.getText({ first: 1, last: 2 });
-      const text = (textRes?.text ?? '').trim();
-
-      // If the PDF has real text, prefer it (more accurate than OCR).
-      if (text.length >= 80) return parsePlainText(text);
-
-      // Optional scanned-PDF fallback; never let this fail the request.
+      const doc = await loadingTask.promise;
       try {
-        const shot = await parser.getScreenshot({
-          first: 1,
-          scale: 1.5,
-          imageDataUrl: false,
-          imageBuffer: true,
-        });
-        const firstPage = shot?.pages?.[0]?.data;
-        if (firstPage && Buffer.isBuffer(firstPage)) {
-          return await extractFromImage(firstPage);
+        const maxPages = Math.min(2, doc.numPages || 1);
+        const pageTexts: string[] = [];
+        for (let i = 1; i <= maxPages; i++) {
+          const page = await doc.getPage(i);
+          try {
+            const content = await page.getTextContent();
+            const pageText = (content.items ?? [])
+              .map((item: unknown) => {
+                if (item && typeof item === 'object' && 'str' in item) {
+                  return String((item as { str: unknown }).str ?? '');
+                }
+                return '';
+              })
+              .join(' ')
+              .trim();
+            if (pageText) pageTexts.push(pageText);
+          } finally {
+            page.cleanup();
+          }
         }
-      } catch {
-        // ignore and fall through
-      }
 
-      return parsePlainText(text);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Absolute safety net for deployed worker/path failures from pdf.js.
-      if (/fake worker|pdf\.worker|Cannot find module/i.test(message)) {
-        return emptyExtraction({ pdf_error: message });
+        const text = pageTexts.join('\n').trim();
+        if (text.length > 0) return parsePlainText(text);
+
+        // Scanned/image-only PDF: no selectable text available in this worker-free path.
+        return emptyExtraction({ pdf_warning: 'No selectable text found in PDF' });
+      } finally {
+        await doc.destroy();
       }
-      throw err;
+    } finally {
+      await loadingTask.destroy();
     }
-  } finally {
-    await parser.destroy().catch(() => {});
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return emptyExtraction({ pdf_error: message });
   }
 }
 
