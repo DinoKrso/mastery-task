@@ -91,23 +91,6 @@ async function buildOcrImageVariants(buffer: Buffer): Promise<OcrImageVariant[]>
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
-    promise
-      .then(value => {
-        clearTimeout(timeout);
-        resolve(value);
-      })
-      .catch(err => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-  });
-}
-
 type TsvWord = {
   page: number;
   block: number;
@@ -244,7 +227,7 @@ function scoreExtraction(parsed: ExtractedData, text: string, confidence: number
 }
 
 async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
-  const maxOcrMs = 12_000;
+  const maxOcrMs = 8_000;
   const startedAt = Date.now();
   let worker: Awaited<ReturnType<typeof import('tesseract.js')['createWorker']>> | null = null;
 
@@ -256,58 +239,66 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
     worker = await createWorker('eng', undefined, { workerPath });
 
     const variants = await buildOcrImageVariants(buffer);
-    const psmModes: PSM[] = [PSM.SINGLE_BLOCK, PSM.SINGLE_COLUMN, PSM.SPARSE_TEXT];
+    // Keep OCR bounded and predictable: fewer combinations, better latency.
+    const psmModes: PSM[] = [PSM.SINGLE_BLOCK, PSM.SINGLE_COLUMN];
     const attempts: OcrAttempt[] = [];
     let bestSoFar: OcrAttempt | null = null;
 
-    for (const variant of variants) {
-      for (const psm of psmModes) {
-        const remainingMs = maxOcrMs - (Date.now() - startedAt);
-        if (remainingMs < 1_500) break;
+    // Prefer high-signal paths first. This avoids "forever" uploads on screenshots.
+    const fastPlan: Array<{ variantName: string; psm: PSM }> = [
+      { variantName: 'raw', psm: PSM.SINGLE_BLOCK },
+      { variantName: 'normalized', psm: PSM.SINGLE_BLOCK },
+      { variantName: 'threshold', psm: PSM.SINGLE_COLUMN },
+      { variantName: 'raw', psm: PSM.SINGLE_COLUMN },
+    ];
 
-        await worker.setParameters({
-          tessedit_pageseg_mode: psm,
-          preserve_interword_spaces: '1',
-        });
+    for (const step of fastPlan) {
+      const variant = variants.find(v => v.name === step.variantName);
+      if (!variant) continue;
+      const psm = step.psm;
 
-        try {
-          const { data } = await withTimeout(
-            worker.recognize(variant.buffer),
-            Math.min(4_000, remainingMs),
-            `OCR ${variant.name}/psm-${psm}`
-          );
-          const tsvText = reconstructTextFromTsv(data.tsv ?? '');
-          const text = (tsvText || data.text || '').trim();
-          const parsed = parsePlainText(text);
-          const confidence = Number.isFinite(data.confidence) ? data.confidence : 0;
-          const attempt: OcrAttempt = {
-            variant: variant.name,
-            psm,
-            confidence,
-            text,
-            parsed,
-            score: scoreExtraction(parsed, text, confidence),
-          };
-          attempts.push(attempt);
+      const remainingMs = maxOcrMs - (Date.now() - startedAt);
+      if (remainingMs < 1_200) break;
 
-          if (!bestSoFar || attempt.score > bestSoFar.score) bestSoFar = attempt;
-          // Early exit: once we have a strong, internally-consistent extraction, stop trying more variants.
-          if (bestSoFar && bestSoFar.score >= 90 && bestSoFar.text.length >= 120) {
-            break;
-          }
-        } catch (err) {
-          attempts.push({
-            variant: variant.name,
-            psm,
-            confidence: 0,
-            text: '',
-            parsed: emptyExtraction(),
-            score: -100,
-          });
-          console.warn(`OCR attempt failed (${variant.name}/psm-${psm}):`, err);
+      await worker.setParameters({
+        tessedit_pageseg_mode: psm,
+        preserve_interword_spaces: '1',
+      });
+
+      try {
+        const { data } = await worker.recognize(variant.buffer);
+        const tsvText = reconstructTextFromTsv(data.tsv ?? '');
+        const text = (tsvText || data.text || '').trim();
+        const parsed = parsePlainText(text);
+        const confidence = Number.isFinite(data.confidence) ? data.confidence : 0;
+        const attempt: OcrAttempt = {
+          variant: variant.name,
+          psm,
+          confidence,
+          text,
+          parsed,
+          score: scoreExtraction(parsed, text, confidence),
+        };
+        attempts.push(attempt);
+
+        if (!bestSoFar || attempt.score > bestSoFar.score) bestSoFar = attempt;
+        // Strong result found: stop early.
+        if (bestSoFar && (bestSoFar.score >= 82 || (bestSoFar.score >= 70 && bestSoFar.text.length >= 160))) {
+          break;
         }
+      } catch (err) {
+        attempts.push({
+          variant: variant.name,
+          psm,
+          confidence: 0,
+          text: '',
+          parsed: emptyExtraction(),
+          score: -100,
+        });
+        console.warn(`OCR attempt failed (${variant.name}/psm-${psm}):`, err);
       }
-      if (bestSoFar && bestSoFar.score >= 90 && bestSoFar.text.length >= 120) break;
+
+      if (Date.now() - startedAt > maxOcrMs) break;
     }
 
     attempts.sort((a, b) => b.score - a.score);
@@ -371,35 +362,43 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
 
   const { PDFParse } = await import('pdf-parse');
   // Critical for serverless: avoid any PDF.js worker initialization, because the worker module
-  // often isn't packaged in the deployed runtime (causing \"Setting up fake worker failed\").
+  // often isn't packaged in the deployed runtime (causing "Setting up fake worker failed").
   const parser = new PDFParse({ data: buffer, disableWorker: true } as unknown as ConstructorParameters<typeof PDFParse>[0]);
   try {
-    const textRes = await parser.getText({ first: 1, last: 2 });
-    const text = (textRes?.text ?? '').trim();
-
-    // If the PDF has real text, prefer it (more accurate than OCR).
-    if (text.length >= 80) return parsePlainText(text);
-
-    // Otherwise, treat it as a scanned PDF. Screenshot rendering is slow and can be fragile
-    // in some deployments; keep it best-effort and never fail the whole request.
     try {
-      const shot = await parser.getScreenshot({
-        first: 1,
-        scale: 2,
-        imageDataUrl: false,
-        imageBuffer: true,
-      });
-      const firstPage = shot?.pages?.[0]?.data;
-      if (firstPage && Buffer.isBuffer(firstPage)) {
-        return await extractFromImage(firstPage);
-      }
-    } catch {
-      // ignore and fall through
-    }
+      const textRes = await parser.getText({ first: 1, last: 2 });
+      const text = (textRes?.text ?? '').trim();
 
-    return parsePlainText(text);
+      // If the PDF has real text, prefer it (more accurate than OCR).
+      if (text.length >= 80) return parsePlainText(text);
+
+      // Optional scanned-PDF fallback; never let this fail the request.
+      try {
+        const shot = await parser.getScreenshot({
+          first: 1,
+          scale: 1.5,
+          imageDataUrl: false,
+          imageBuffer: true,
+        });
+        const firstPage = shot?.pages?.[0]?.data;
+        if (firstPage && Buffer.isBuffer(firstPage)) {
+          return await extractFromImage(firstPage);
+        }
+      } catch {
+        // ignore and fall through
+      }
+
+      return parsePlainText(text);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Absolute safety net for deployed worker/path failures from pdf.js.
+      if (/fake worker|pdf\.worker|Cannot find module/i.test(message)) {
+        return emptyExtraction({ pdf_error: message });
+      }
+      throw err;
+    }
   } finally {
-    await parser.destroy();
+    await parser.destroy().catch(() => {});
   }
 }
 
