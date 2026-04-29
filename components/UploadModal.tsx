@@ -13,7 +13,7 @@ interface Props {
 type UploadState = { status: 'idle' } | { status: 'uploading'; filename: string } | { status: 'success'; docId: string } | { status: 'error'; message: string };
 
 const ACCEPTED = '.pdf,.png,.jpg,.jpeg,.gif,.webp,.csv,.txt';
-const EXTRACT_TIMEOUT_MS = 30_000;
+const EXTRACT_TIMEOUT_MS = 60_000;
 
 export function UploadModal({ open, onClose }: Props) {
   const router = useRouter();

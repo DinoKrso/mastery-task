@@ -6,6 +6,9 @@ import { ExtractedData, FileType } from '@/lib/types';
 import type { PSM } from 'tesseract.js';
 
 export const runtime = 'nodejs';
+// Vercel default function timeout is ~10s. OCR cold start + parsing easily exceeds that.
+// Bumping to 60s is the max on Vercel Hobby; Pro plans support more.
+export const maxDuration = 60;
 
 type ExtractedWithDebug = ExtractedData & {
   _debug?: Record<string, unknown>;
@@ -397,23 +400,48 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
         for (let i = 1; i <= maxPages; i++) {
           const page = await doc.getPage(i);
           try {
+            const viewport = page.getViewport({ scale: 1 });
             const content = await page.getTextContent();
-            const pageText = (content.items ?? [])
-              .map((item: unknown) => {
-                if (item && typeof item === 'object' && 'str' in item) {
-                  return String((item as { str: unknown }).str ?? '');
-                }
-                return '';
-              })
-              .join(' ')
-              .trim();
+            // Reconstruct lines from item positions so the downstream parser can
+            // recognise things like "Subtotal: 950" or "Total: 800.00" on their
+            // own line. A naive join with spaces would lose all line structure.
+            type Item = { str?: string; transform?: number[]; hasEOL?: boolean; width?: number };
+            const items = (content.items ?? []) as Item[];
+            const buf: string[] = [];
+            let lastY: number | null = null;
+            let lastX: number | null = null;
+            const lineThreshold = 4; // px in viewport coords
+            const wordGap = 2;       // px gap that implies a space
+            for (const item of items) {
+              if (!item || typeof item.str !== 'string') continue;
+              const tm = item.transform;
+              if (!tm || tm.length < 6) {
+                buf.push(item.str);
+                continue;
+              }
+              const [x, y] = viewport.convertToViewportPoint(tm[4], tm[5]);
+              if (lastY !== null && Math.abs(lastY - y) > lineThreshold) {
+                buf.push('\n');
+                lastX = null;
+              } else if (lastX !== null && x - lastX > wordGap) {
+                buf.push(' ');
+              }
+              buf.push(item.str);
+              lastX = x + (item.width ?? 0);
+              lastY = y;
+              if (item.hasEOL) {
+                buf.push('\n');
+                lastX = null;
+              }
+            }
+            const pageText = buf.join('').replace(/[ \t]+\n/g, '\n').trim();
             if (pageText) pageTexts.push(pageText);
           } finally {
             page.cleanup();
           }
         }
 
-        const text = pageTexts.join('\n').trim();
+        const text = pageTexts.join('\n\n').trim();
         if (text.length > 0) return parsePlainText(text);
 
         // Scanned/image-only PDF: no selectable text available in this worker-free path.
