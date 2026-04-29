@@ -244,7 +244,7 @@ function scoreExtraction(parsed: ExtractedData, text: string, confidence: number
 }
 
 async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
-  const maxOcrMs = 18_000;
+  const maxOcrMs = 12_000;
   const startedAt = Date.now();
   let worker: Awaited<ReturnType<typeof import('tesseract.js')['createWorker']>> | null = null;
 
@@ -258,6 +258,7 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
     const variants = await buildOcrImageVariants(buffer);
     const psmModes: PSM[] = [PSM.SINGLE_BLOCK, PSM.SINGLE_COLUMN, PSM.SPARSE_TEXT];
     const attempts: OcrAttempt[] = [];
+    let bestSoFar: OcrAttempt | null = null;
 
     for (const variant of variants) {
       for (const psm of psmModes) {
@@ -272,21 +273,28 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
         try {
           const { data } = await withTimeout(
             worker.recognize(variant.buffer),
-            Math.min(6_000, remainingMs),
+            Math.min(4_000, remainingMs),
             `OCR ${variant.name}/psm-${psm}`
           );
           const tsvText = reconstructTextFromTsv(data.tsv ?? '');
           const text = (tsvText || data.text || '').trim();
           const parsed = parsePlainText(text);
           const confidence = Number.isFinite(data.confidence) ? data.confidence : 0;
-          attempts.push({
+          const attempt: OcrAttempt = {
             variant: variant.name,
             psm,
             confidence,
             text,
             parsed,
             score: scoreExtraction(parsed, text, confidence),
-          });
+          };
+          attempts.push(attempt);
+
+          if (!bestSoFar || attempt.score > bestSoFar.score) bestSoFar = attempt;
+          // Early exit: once we have a strong, internally-consistent extraction, stop trying more variants.
+          if (bestSoFar && bestSoFar.score >= 90 && bestSoFar.text.length >= 120) {
+            break;
+          }
         } catch (err) {
           attempts.push({
             variant: variant.name,
@@ -299,6 +307,7 @@ async function extractFromImage(buffer: Buffer): Promise<ExtractedWithDebug> {
           console.warn(`OCR attempt failed (${variant.name}/psm-${psm}):`, err);
         }
       }
+      if (bestSoFar && bestSoFar.score >= 90 && bestSoFar.text.length >= 120) break;
     }
 
     attempts.sort((a, b) => b.score - a.score);
@@ -360,20 +369,10 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
     (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix = (mod as { default: unknown }).default;
   }
 
-  // pdfjs-dist v5 doesn't always ship the legacy worker module in serverless bundles.
-  // Point pdf.js workerSrc at the worker that ships with pdf-parse.
-  try {
-    const { join } = await import('node:path');
-    const { pathToFileURL } = await import('node:url');
-    const { GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
-    const workerFsPath = join(process.cwd(), 'node_modules/pdf-parse/dist/pdf-parse/esm/pdf.worker.mjs');
-    GlobalWorkerOptions.workerSrc = pathToFileURL(workerFsPath).toString();
-  } catch {
-    // Best-effort: if this fails, pdf.js may still be able to run in fake-worker mode locally.
-  }
-
   const { PDFParse } = await import('pdf-parse');
-  const parser = new PDFParse({ data: buffer });
+  // Critical for serverless: avoid any PDF.js worker initialization, because the worker module
+  // often isn't packaged in the deployed runtime (causing \"Setting up fake worker failed\").
+  const parser = new PDFParse({ data: buffer, disableWorker: true } as unknown as ConstructorParameters<typeof PDFParse>[0]);
   try {
     const textRes = await parser.getText({ first: 1, last: 2 });
     const text = (textRes?.text ?? '').trim();
@@ -381,16 +380,21 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
     // If the PDF has real text, prefer it (more accurate than OCR).
     if (text.length >= 80) return parsePlainText(text);
 
-    // Otherwise, treat it as a scanned PDF: render page(s) to PNG, then OCR.
-    const shot = await parser.getScreenshot({
-      first: 1,
-      scale: 2,
-      imageDataUrl: false,
-      imageBuffer: true,
-    });
-    const firstPage = shot?.pages?.[0]?.data;
-    if (firstPage && Buffer.isBuffer(firstPage)) {
-      return await extractFromImage(firstPage);
+    // Otherwise, treat it as a scanned PDF. Screenshot rendering is slow and can be fragile
+    // in some deployments; keep it best-effort and never fail the whole request.
+    try {
+      const shot = await parser.getScreenshot({
+        first: 1,
+        scale: 2,
+        imageDataUrl: false,
+        imageBuffer: true,
+      });
+      const firstPage = shot?.pages?.[0]?.data;
+      if (firstPage && Buffer.isBuffer(firstPage)) {
+        return await extractFromImage(firstPage);
+      }
+    } catch {
+      // ignore and fall through
     }
 
     return parsePlainText(text);
