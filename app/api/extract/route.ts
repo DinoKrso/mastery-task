@@ -360,6 +360,18 @@ async function extractFromPdf(buffer: Buffer): Promise<ExtractedData> {
     (globalThis as unknown as { DOMMatrix?: unknown }).DOMMatrix = (mod as { default: unknown }).default;
   }
 
+  // pdfjs-dist v5 doesn't always ship the legacy worker module in serverless bundles.
+  // Point pdf.js workerSrc at the worker that ships with pdf-parse.
+  try {
+    const { join } = await import('node:path');
+    const { pathToFileURL } = await import('node:url');
+    const { GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const workerFsPath = join(process.cwd(), 'node_modules/pdf-parse/dist/pdf-parse/esm/pdf.worker.mjs');
+    GlobalWorkerOptions.workerSrc = pathToFileURL(workerFsPath).toString();
+  } catch {
+    // Best-effort: if this fails, pdf.js may still be able to run in fake-worker mode locally.
+  }
+
   const { PDFParse } = await import('pdf-parse');
   const parser = new PDFParse({ data: buffer });
   try {
